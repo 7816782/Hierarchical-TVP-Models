@@ -1,0 +1,284 @@
+# Sampling state distribution
+state.sampler <- function(y,X,beta,theta.sqrt, D0, sigma2) {
+  Tn <- length(y)
+  d  <- ncol(X)
+  D.theta = diag(theta.sqrt)
+  ytilde <- as.numeric(y - X %*% beta)
+  Ft     <- X %*% D.theta
+  
+  n <- (Tn + 1L) * d
+  Omega <- matrix(0, n, n)
+  I_d <- diag(d)
+  # Omega00
+  D0inv <- diag(1/D0)
+  Omega[1:d, 1:d] <- D0inv + I_d
+  
+  # Off-diagonal blocks
+  for (t in 1:Tn) {
+    s <- (t * d + 1):((t + 1L) * d)
+    r <- ((t - 1L) * d + 1):(t * d)
+    Omega[r, s] <-  - I_d
+    Omega[s, r] <-  - I_d
+  }
+  
+  # Main diagonal blocks
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    K   <- tcrossprod(Ft[t,]) / sigma2
+    baseI <- if (t < Tn) 2 * I_d else I_d
+    Omega[blk, blk] <- baseI + K
+  }
+  
+  # vector c
+  cvec <- numeric(n)
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    cvec[blk] <- as.numeric(ytilde[t] / sigma2) * Ft[t, ]
+  }
+  
+  # AWOL draw via Cholesky: Omega = R'R
+  R <- chol(Omega)                     
+  a <- forwardsolve(t(R), cvec)       
+  z <- a + rnorm(n)                    
+  beta_tilde_vec <- backsolve(R, z)
+  
+  # Return states
+  beta.tilde = matrix(beta_tilde_vec, nrow = Tn + 1L, ncol = d, byrow = TRUE)
+  return(beta.tilde)
+}
+
+# Sampling beta and theta.square root
+coeff.sampler = function(y,X,beta.tilde,lambda.theta,lambda.beta,sigma2){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  A0.sqrt = diag(c(lambda.beta,lambda.theta))
+  G = crossprod(W)/sigma2
+  A_T.star = solve(A0.sqrt%*%G%*%A0.sqrt + 
+                     diag(2*d))
+  A_T = A0.sqrt%*%A_T.star%*%A0.sqrt
+  K = crossprod(W,y)/sigma2
+  a_T = A_T %*% K
+  R = chol(A_T)
+  gam = a_T + t(R) %*% rnorm(2*d)
+  gam.sampler = list(beta = gam[1:d],theta.sqrt = gam[(d+1):(2*d)])
+  return(gam.sampler)
+}
+
+# Interweaving step
+interwave = function(y,X,beta,beta.tilde,theta.sqrt,lambda.theta,lambda.beta,D0){
+  Tn <- length(y)
+  d  <- ncol(X)
+  for (j in 1:d){
+    # c1
+    beta.center = beta[j] + theta.sqrt[j]*beta.tilde[,j]
+    sgn <- if (theta.sqrt[j] >= 0) 1 else -1
+    #c2
+    dif = diff(beta.center)
+    theta = GIGrvg::rgig(n=1,lambda=-Tn/2,psi = max(1/lambda.theta[j]^2,1e-7),
+                         chi = max(sum(dif^2)+(beta.center[1]-beta[j])^2/D0[j],1e-7))
+    var = (lambda.beta[j]^2*theta*D0[j])/(lambda.beta[j]^2+theta*D0[j])
+    beta[j] = rnorm(1,(beta.center[1]*lambda.beta[j]^2)/(lambda.beta[j]^2+
+                                                           theta*D0[j]),sqrt(var))
+    #c3
+    theta.sqrt[j] = sgn*sqrt(theta)
+    beta.tilde[,j] = (beta.center - beta[j])/theta.sqrt[j]
+  }
+  return(list(beta = beta,theta.sqrt = theta.sqrt,beta.tilde = beta.tilde))
+}
+
+# switch the sign for handling the identifiability problem
+sign_switch <- function(beta.tilde, theta.sqrt) {
+  d <- length(theta.sqrt)
+  for (j in 1:d) {
+    if (runif(1) < 0.5) {               
+      theta.sqrt[j]  <- -theta.sqrt[j]
+      beta.tilde[,j] <- -beta.tilde[,j]
+    }
+  }
+  list(beta.tilde = beta.tilde, theta.sqrt = theta.sqrt)
+}
+
+# map group-level vector (length G) to coefficient-level (length d)
+expand_group <- function(v_g, grp) v_g[grp]
+
+# numerical clamp
+.clamp <- function(x, eps = 1e-7) pmax(x, eps)
+
+local.shrink.sampler.group <- function(X, theta.sqrt, xi.theta.g, beta, xi.beta.g, grp) {
+  d <- ncol(X)
+  G <- max(grp)
+  s_g <- tabulate(grp, G)
+  
+  lambda.theta.g.sqr <- numeric(G)
+  lambda.beta.g.sqr  <- numeric(G)
+  
+  ss_theta <- tapply(theta.sqrt^2, grp, sum, default = 0)
+  ss_beta  <- tapply(beta^2,grp, sum, default = 0)
+  
+  for (g in seq_len(G)) {
+    # GIG params: lambda = (1 - s_g)/2 ; chi = sum of squares ; psi = 2*xi_g
+    lam_par_theta <- (1 - s_g[g]) / 2
+    chi_theta <- .clamp(ss_theta[g])
+    psi_theta <- .clamp(2 * xi.theta.g[g])
+    lambda.theta.g.sqr[g] <- GIGrvg::rgig(1, lam_par_theta, chi_theta, psi_theta)
+    
+    lam_par_beta <- (1 - s_g[g]) / 2
+    chi_beta <- .clamp(ss_beta[g])
+    psi_beta <- .clamp(2 * xi.beta.g[g])
+    lambda.beta.g.sqr[g] <- GIGrvg::rgig(1, lam_par_beta, chi_beta, psi_beta)
+  }
+  
+  lambda.theta.g <- sqrt(lambda.theta.g.sqr)
+  lambda.beta.g  <- sqrt(lambda.beta.g.sqr)
+  
+  # expand to coefficient-level vectors (length d) to keep your API unchanged
+  lambda.theta <- expand_group(lambda.theta.g, grp)
+  lambda.beta  <- expand_group(lambda.beta.g,  grp)
+  
+  list(lambda.theta = lambda.theta,
+       lambda.beta  = lambda.beta,
+       lambda.theta.g = lambda.theta.g,
+       lambda.beta.g  = lambda.beta.g)
+}
+
+
+# Sampling the global shrinkage parameter tau.theta and tau.beta
+global.shrink.sampler.group <- function(xi.theta.g, nu.theta, xi.beta.g, nu.beta, G) {
+  tau.theta.sqr <- rgamma(1, (G + 1) / 2, sum(xi.theta.g) + nu.theta)
+  tau.beta.sqr  <- rgamma(1, (G + 1) / 2, sum(xi.beta.g)  + nu.beta)
+  list(tau.theta = sqrt(tau.theta.sqr),
+       tau.beta  = sqrt(tau.beta.sqr))
+}
+
+auxiliary.sampler.group <- function(lambda.theta.g, tau.theta, lambda.beta.g, tau.beta, G) {
+  xi.theta.g <- numeric(G)
+  xi.beta.g  <- numeric(G)
+  for (g in seq_len(G)) {
+    xi.theta.g[g] <- rgamma(1, 1, lambda.theta.g[g]^2 + tau.theta^2)
+    xi.beta.g[g]  <- rgamma(1, 1, lambda.beta.g[g]^2  + tau.beta^2)
+  }
+  nu.theta <- rgamma(1, 1, 1 + tau.theta^2)
+  nu.beta  <- rgamma(1, 1, 1 + tau.beta^2)
+  list(xi.theta.g = xi.theta.g, xi.beta.g = xi.beta.g,
+       nu.theta = nu.theta, nu.beta = nu.beta)
+}
+
+# Sampling the noise variance
+variance.sampler = function(y,X,beta.tilde,beta,theta.sqrt,c0,C0){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  gam = c(beta,theta.sqrt)
+  var = C0 + 0.5*sum((y- W %*% gam)^2)
+  sigma2 = 1/rgamma(1,c0+Tn/2,var)
+  return(sigma2)
+}
+
+# Sampling C0 which is the auxiliary variable for the noise variance
+C0.sampler = function(sigma2,c0,g0,G0){
+  C0 = rgamma(1,g0+c0,G0 + 1/sigma2)
+  return(C0)
+}
+
+# Sampling the scale parameters of the initial distribution
+D0.sampler = function(X,beta.tilde,vd,cd){
+  d  <- ncol(X)
+  btild.zero = beta.tilde[1,]
+  D0 = rep(0,d)
+  for (j in 1:d){
+    D0[j] = 1/rgamma(1,vd+0.5,(vd-1)*cd+0.5*btild.zero[j]^2)
+  }
+  return(D0)
+}
+
+shrinktvp_grouped <- function(y, X,
+                              beta, theta.sqrt, D0,
+                              lambda.theta, lambda.beta,
+                              tau.theta, tau.beta,
+                              xi.theta.g, xi.beta.g, nu.theta, nu.beta,
+                              sigma2, C0,
+                              cd, vd, c0, g0, G0,
+                              burnin, N,
+                              grp) {
+  Tn <- length(y)
+  d  <- ncol(X)
+  G  <- max(grp)
+  
+  beta.sample         <- matrix(0, N, d)
+  theta.sqrt.sample   <- matrix(0, N, d)
+  lambda.theta.sample <- matrix(0, N, d)   # per-coef (expanded from group)
+  lambda.beta.sample  <- matrix(0, N, d)
+  tau.theta.sample    <- numeric(N)
+  tau.beta.sample     <- numeric(N)
+  
+  for (i in 1:N) {
+    beta.tilde <- state.sampler(y, X, beta, theta.sqrt, D0, sigma2)
+    
+    gam.sampler <- coeff.sampler(y, X, beta.tilde, lambda.theta, lambda.beta, sigma2)
+    beta       <- gam.sampler$beta
+    theta.sqrt <- gam.sampler$theta.sqrt
+    
+    weaving.result <- interwave(y, X, beta, beta.tilde, theta.sqrt,
+                                lambda.theta, lambda.beta, D0)
+    theta.sqrt <- weaving.result$theta.sqrt
+    beta       <- weaving.result$beta
+    beta.tilde <- weaving.result$beta.tilde
+    beta.sample[i, ] <- beta
+    
+    # 3b) Sign switch
+    sw <- sign_switch(beta.tilde, theta.sqrt)
+    beta.tilde <- sw$beta.tilde
+    theta.sqrt <- sw$theta.sqrt
+    theta.sqrt.sample[i, ] <- theta.sqrt
+    
+    # 4) Grouped local shrinkage
+    local.g <- local.shrink.sampler.group(X, theta.sqrt, xi.theta.g, beta, xi.beta.g, grp)
+    lambda.theta <- local.g$lambda.theta   # per-coef
+    lambda.beta  <- local.g$lambda.beta
+    # lambda.theta.g <- local.g$lambda.theta.g
+    # lambda.beta.g  <- local.g$lambda.beta.g
+    
+    lambda.theta.sample[i, ] <- lambda.theta
+    lambda.beta.sample[i, ]  <- lambda.beta
+    # lambda.theta.g.sample[i, ] <- lambda.theta.g
+    # lambda.beta.g.sample[i, ]  <- lambda.beta.g
+    
+    # 5) Grouped global shrinkage
+    glob <- global.shrink.sampler.group(xi.theta.g, nu.theta, xi.beta.g, nu.beta, G)
+    tau.theta <- glob$tau.theta
+    tau.beta  <- glob$tau.beta
+    tau.theta.sample[i] <- tau.theta
+    tau.beta.sample[i]  <- tau.beta
+    
+    lambda.theta.g <- tapply(lambda.theta, grp, mean)
+    lambda.beta.g  <- tapply(lambda.beta,  grp, mean)
+    aux <- auxiliary.sampler.group(lambda.theta.g, tau.theta, lambda.beta.g, tau.beta, G)
+    xi.theta.g <- aux$xi.theta.g
+    xi.beta.g  <- aux$xi.beta.g
+    nu.theta   <- aux$nu.theta
+    nu.beta    <- aux$nu.beta
+    
+    # 7) Observation variance and hyper
+    sigma2 <- variance.sampler(y, X, beta.tilde, beta, theta.sqrt, c0, C0)
+    C0     <- C0.sampler(sigma2, c0, g0, G0)
+    
+    # 8) Initial scale D0
+    D0 <- D0.sampler(X, beta.tilde, vd, cd)
+  }
+  
+  keep <- seq.int(from = min(burnin + 1L, N), to = N)
+  MCMCsampler <- list(
+    beta         = beta.sample[keep, , drop = FALSE],
+    theta.sqrt   = theta.sqrt.sample[keep, , drop = FALSE],
+    lambda.theta = lambda.theta.sample[keep, , drop = FALSE],  # still per-coef for compatibility
+    lambda.beta  = lambda.beta.sample[keep, , drop = FALSE],
+    tau.theta    = tau.theta.sample[keep],
+    tau.beta     = tau.beta.sample[keep]
+    # , lambda.theta.g = lambda.theta.g.sample[keep, , drop = FALSE],
+    #   lambda.beta.g  = lambda.beta.g.sample[keep, , drop = FALSE]
+  )
+  return(MCMCsampler)
+}
