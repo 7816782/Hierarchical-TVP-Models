@@ -1,0 +1,231 @@
+# Sampling state distribution
+state.sampler <- function(y,X,beta,theta.sqrt, D0, sigma2) {
+  Tn <- length(y)
+  d  <- ncol(X)
+  D.theta = diag(theta.sqrt)
+  ytilde <- as.numeric(y - X %*% beta)
+  Ft     <- X %*% D.theta
+  
+  n <- (Tn + 1L) * d
+  Omega <- matrix(0, n, n)
+  I_d <- diag(d)
+  # Omega00
+  D0inv <- diag(1/D0)
+  Omega[1:d, 1:d] <- D0inv + I_d
+  
+  # Off-diagonal blocks
+  for (t in 1:Tn) {
+    s <- (t * d + 1):((t + 1L) * d)
+    r <- ((t - 1L) * d + 1):(t * d)
+    Omega[r, s] <-  - I_d
+    Omega[s, r] <-  - I_d
+  }
+  
+  # Main diagonal blocks
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    K   <- tcrossprod(Ft[t,]) / sigma2
+    baseI <- if (t < Tn) 2 * I_d else I_d
+    Omega[blk, blk] <- baseI + K
+  }
+  
+  # vector c
+  cvec <- numeric(n)
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    cvec[blk] <- as.numeric(ytilde[t] / sigma2) * Ft[t, ]
+  }
+  
+  # AWOL draw via Cholesky: Omega = R'R
+  R <- chol(Omega)                     
+  a <- forwardsolve(t(R), cvec)       
+  z <- a + rnorm(n)                    
+  beta_tilde_vec <- backsolve(R, z)
+  
+  # Return states
+  beta.tilde = matrix(beta_tilde_vec, nrow = Tn + 1L, ncol = d, byrow = TRUE)
+  return(beta.tilde)
+}
+
+# Sampling beta and theta.square root
+coeff.sampler = function(y,X,beta.tilde,lambda.theta,lambda.beta,sigma2){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  A0.sqrt = diag(c(lambda.beta,lambda.theta))
+  G = crossprod(W)/sigma2
+  A_T.star = solve(A0.sqrt%*%G%*%A0.sqrt + 
+                     diag(2*d))
+  A_T = A0.sqrt%*%A_T.star%*%A0.sqrt
+  K = crossprod(W,y)/sigma2
+  a_T = A_T %*% K
+  R = chol(A_T)
+  gam = a_T + t(R) %*% rnorm(2*d)
+  gam.sampler = list(beta = gam[1:d],theta.sqrt = gam[(d+1):(2*d)])
+  return(gam.sampler)
+}
+
+# Interweaving step
+interwave = function(y,X,beta,beta.tilde,theta.sqrt,lambda.theta,lambda.beta,D0){
+  Tn <- length(y)
+  d  <- ncol(X)
+  for (j in 1:d){
+    # c1
+    beta.center = beta[j] + theta.sqrt[j]*beta.tilde[,j]
+    sgn <- if (theta.sqrt[j] >= 0) 1 else -1
+    #c2
+    dif = diff(beta.center)
+    theta = GIGrvg::rgig(n=1,lambda=-Tn/2,psi = max(1/lambda.theta[j]^2,1e-7),
+                         chi = max(sum(dif^2)+(beta.center[1]-beta[j])^2/D0[j],1e-7))
+    var = (lambda.beta[j]^2*theta*D0[j])/(lambda.beta[j]^2+theta*D0[j])
+    beta[j] = rnorm(1,(beta.center[1]*lambda.beta[j]^2)/(lambda.beta[j]^2+
+                                                           theta*D0[j]),sqrt(var))
+    #c3
+    theta.sqrt[j] = sgn*sqrt(theta)
+    beta.tilde[,j] = (beta.center - beta[j])/theta.sqrt[j]
+  }
+  return(list(beta = beta,theta.sqrt = theta.sqrt,beta.tilde = beta.tilde))
+}
+
+# switch the sign for handling the identifiability problem
+sign_switch <- function(beta.tilde, theta.sqrt) {
+  d <- length(theta.sqrt)
+  for (j in 1:d) {
+    if (runif(1) < 0.5) {               # flip with prob 1/2
+      theta.sqrt[j]  <- -theta.sqrt[j]
+      beta.tilde[,j] <- -beta.tilde[,j] # keep likelihood identical
+    }
+  }
+  list(beta.tilde = beta.tilde, theta.sqrt = theta.sqrt)
+}
+
+# Sampling the local shrinkage parameter lambda.theta and lambda.beta
+local.shrink.sampler = function(X,theta.sqrt,xi.theta,beta,xi.beta){
+  d  <- ncol(X)
+  theta = theta.sqrt^2
+  lambda.theta.sqr = rep(0,d)
+  lambda.beta.sqr = rep(0,d)
+  for (j in 1:d){
+    lambda.theta.sqr[j] = GIGrvg::rgig(1,0,max(theta[j],1e-7),max(2*xi.theta[j],1e-7))
+    lambda.beta.sqr[j] = GIGrvg::rgig(1,0,max(beta[j]^2,1e-7),max(2*xi.beta[j],1e-7))
+  }
+  local.shrink = list(lambda.theta = sqrt(lambda.theta.sqr), 
+                      lambda.beta = sqrt(lambda.beta.sqr))
+  return(local.shrink)
+}
+
+# Sampling the global shrinkage parameter tau.theta and tau.beta
+global.shrink.sampler = function(X,xi.theta,nu.theta,xi.beta,nu.beta){
+  d  <- ncol(X)
+  tau.theta.sqr = rgamma(1,(d+1)/2,sum(xi.theta)+nu.theta)
+  tau.beta.sqr = rgamma(1,(d+1)/2,sum(xi.beta)+nu.beta)
+  return(list(tau.theta = sqrt(tau.theta.sqr),tau.beta = sqrt(tau.beta.sqr)))
+}
+
+# Sampling the auxiliary variables xi.theta,xi.beta, and nu.theta, nu.beta
+auxiliary.sampler = function(X,lambda.theta,tau.theta,lambda.beta,tau.beta){
+  d  <- ncol(X)
+  xi.theta.sample = rep(0,d)
+  xi.beta.sample = rep(0,d)
+  for (j in 1:d){
+    xi.theta.sample[j] = rgamma(1,1,lambda.theta[j]^2+tau.theta^2)
+    xi.beta.sample[j] = rgamma(1,1,lambda.beta[j]^2+tau.beta^2)
+  }
+  nu.theta.sample = rgamma(1,1,1+tau.theta^2)
+  nu.beta.sample = rgamma(1,1,1+tau.beta^2)
+  return(list(xi.theta =xi.theta.sample,xi.beta =xi.beta.sample,
+              nu.theta = nu.theta.sample,nu.beta = nu.beta.sample))
+}
+
+# Sampling the noise variance
+variance.sampler = function(y,X,beta.tilde,beta,theta.sqrt,c0,C0){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  gam = c(beta,theta.sqrt)
+  var = C0 + 0.5*sum((y- W %*% gam)^2)
+  sigma2 = 1/rgamma(1,c0+Tn/2,var)
+  return(sigma2)
+}
+
+# Sampling C0 which is the auxiliary variable for the noise variance
+C0.sampler = function(sigma2,c0,g0,G0){
+  C0 = rgamma(1,g0+c0,G0 + 1/sigma2)
+  return(C0)
+}
+
+# Sampling the scale parameters of the initial distribution
+D0.sampler = function(X,beta.tilde,vd,cd){
+  d  <- ncol(X)
+  btild.zero = beta.tilde[1,]
+  D0 = rep(0,d)
+  for (j in 1:d){
+    D0[j] = 1/rgamma(1,vd+0.5,(vd-1)*cd+0.5*btild.zero[j]^2)
+  }
+  return(D0)
+}
+
+# Main function. y and X should be standardized in advance
+shrinktvp = function(y,X,beta,theta.sqrt,D0,lambda.theta,lambda.beta,tau.theta,tau.beta,
+                     xi.theta,xi.beta,nu.theta,nu.beta,sigma2,C0,
+                     cd,vd,c0,g0,G0,burnin,N){
+  d  <- ncol(X)
+  beta.sample = matrix(0,N,d)
+  theta.sqrt.sample = matrix(0,N,d)
+  lambda.theta.sample = matrix(0,N,d)
+  lambda.beta.sample = matrix(0,N,d)
+  tau.theta.sample = rep(0,N)
+  tau.beta.sample = rep(0,N)
+  for (i in 1:N){
+    # Sampling state
+    beta.tilde = state.sampler(y,X,beta,theta.sqrt, D0, sigma2)
+    # Sampling coefficient(process variance and coefficient)
+    gam.sampler = coeff.sampler(y,X,beta.tilde,lambda.theta,lambda.beta,sigma2)
+    beta = gam.sampler$beta
+    theta.sqrt = gam.sampler$theta.sqrt
+    #Interweaving step
+    weaving.result = interwave(y,X,beta,beta.tilde,theta.sqrt,lambda.theta,lambda.beta,D0)
+    theta.sqrt = weaving.result$theta.sqrt
+    beta = weaving.result$beta
+    beta.tilde = weaving.result$beta.tilde
+    beta.sample[i,] = beta
+    
+    sw <- sign_switch(beta.tilde, theta.sqrt)
+    beta.tilde <- sw$beta.tilde
+    theta.sqrt <- sw$theta.sqrt
+    theta.sqrt.sample[i,] = theta.sqrt
+    # Sampling the local shrinkage parameter
+    local.shrink = local.shrink.sampler(X,theta.sqrt,xi.theta,beta,xi.beta)
+    lambda.theta = local.shrink$lambda.theta
+    lambda.beta= local.shrink$lambda.beta
+    lambda.theta.sample[i,] = local.shrink$lambda.theta
+    lambda.beta.sample[i,] = local.shrink$lambda.beta
+    # Sampling the global shrinkage parameter
+    global.shink = global.shrink.sampler(X,xi.theta,nu.theta,xi.beta,nu.beta)
+    tau.theta = global.shink$tau.theta
+    tau.beta = global.shink$tau.beta
+    tau.theta.sample[i] = global.shink$tau.theta
+    tau.beta.sample[i] = global.shink$tau.beta
+    #Sampling the auxiliary variable
+    auxiliary = auxiliary.sampler(X,lambda.theta,tau.theta,lambda.beta,tau.beta)
+    xi.theta = auxiliary$xi.theta
+    xi.beta = auxiliary$xi.beta
+    nu.theta = auxiliary$nu.theta
+    nu.beta = auxiliary$nu.beta
+    # Sampling the noise variance
+    sigma2 = variance.sampler(y,X,beta.tilde,beta,theta.sqrt,c0,C0)
+    # Sampling the C0
+    C0 = C0.sampler(sigma2,c0,g0,G0)
+    # Sampling the scale parameters of the initial distribution
+    D0 = D0.sampler(X,beta.tilde,vd,cd)
+  }
+  MCMCsampler = list(beta = beta.sample[(burnin +1):N,],
+                     theta.sqrt = theta.sqrt.sample[(burnin +1):N,],
+                     lambda.theta = lambda.theta.sample[(burnin +1):N,],
+                     lambda.beta = lambda.beta.sample[(burnin +1):N,],
+                     tau.theta = tau.theta.sample[(burnin +1):N],
+                     tau.beta = tau.beta.sample[(burnin +1):N])
+  return(MCMCsampler)
+}
