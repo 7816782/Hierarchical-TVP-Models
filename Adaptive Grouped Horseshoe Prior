@@ -1,0 +1,349 @@
+expand_group <- function(v_g, grp) v_g[grp]
+.clamp <- function(x, eps = 1e-12) pmax(x, eps)
+
+state.sampler <- function(y,X,beta,theta.sqrt, D0, sigma2) {
+  Tn <- length(y)
+  d  <- ncol(X)
+  D.theta = diag(theta.sqrt)
+  ytilde <- as.numeric(y - X %*% beta)
+  Ft     <- X %*% D.theta
+  
+  n <- (Tn + 1L) * d
+  Omega <- matrix(0, n, n)
+  I_d <- diag(d)
+  # Omega00
+  D0inv <- diag(1/D0)
+  Omega[1:d, 1:d] <- D0inv + I_d
+  
+  # Off-diagonal blocks
+  for (t in 1:Tn) {
+    s <- (t * d + 1):((t + 1L) * d)
+    r <- ((t - 1L) * d + 1):(t * d)
+    Omega[r, s] <-  - I_d
+    Omega[s, r] <-  - I_d
+  }
+  
+  # Main diagonal blocks
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    K   <- tcrossprod(Ft[t,]) / sigma2
+    baseI <- if (t < Tn) 2 * I_d else I_d
+    Omega[blk, blk] <- baseI + K
+  }
+  
+  # vector c
+  cvec <- numeric(n)
+  for (t in 1:Tn) {
+    blk <- (t * d + 1):((t + 1L) * d)
+    cvec[blk] <- as.numeric(ytilde[t] / sigma2) * Ft[t, ]
+  }
+  
+  # AWOL draw via Cholesky: Omega = R'R
+  R <- chol(Omega)                     
+  a <- forwardsolve(t(R), cvec)       
+  z <- a + rnorm(n)                    
+  beta_tilde_vec <- backsolve(R, z)
+  
+  # Return states
+  beta.tilde = matrix(beta_tilde_vec, nrow = Tn + 1L, ncol = d, byrow = TRUE)
+  return(beta.tilde)
+}
+
+coeff.sampler = function(y,X,beta.tilde,lambda.theta,lambda.beta,sigma2){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  A0.sqrt = diag(c(lambda.beta,lambda.theta))
+  G = crossprod(W)/sigma2
+  A_T.star = solve(A0.sqrt%*%G%*%A0.sqrt + 
+                     diag(2*d))
+  A_T = A0.sqrt%*%A_T.star%*%A0.sqrt
+  K = crossprod(W,y)/sigma2
+  a_T = A_T %*% K
+  R = chol(A_T)
+  gam = a_T + t(R) %*% rnorm(2*d)
+  gam.sampler = list(beta = gam[1:d],theta.sqrt = gam[(d+1):(2*d)])
+  return(gam.sampler)
+}
+
+interweave_hghs <- function(beta, beta.tilde, theta.sqrt,
+                            lambda.theta.g, delta,
+                            lambda.beta.g,  eta,
+                            D0, grp) {
+  d  <- length(beta)
+  Tn <- nrow(beta.tilde) - 1L
+  eps <- 1e-12
+  
+  for (j in seq_len(d)) {
+    g   <- grp[j]
+    sgn <- if (theta.sqrt[j] >= 0) 1 else -1
+    
+    # (3-1) map to centered path: beta_{j,t} = beta_j + sqrt(theta_j) * beta_tilde_{j,t}
+    beta_center <- beta[j] + theta.sqrt[j] * beta.tilde[, j]
+    
+    # (3-2) sample theta_j from GIG(-T/2, psi = 1/(lambda_theta_g^2 * delta_j^2), chi = sum RW increments + (beta0 - beta)^2/D0 )
+    dif  <- diff(beta_center)                          # length Tn
+    chi  <- sum(dif^2) + (beta_center[1] - beta[j])^2 / max(D0[j], eps)
+    psi  <- 1 / (max(lambda.theta.g[g]^2, eps) * max(delta[j]^2, eps))
+    theta <- GIGrvg::rgig(1, lambda = -Tn/2,
+                          chi = max(chi, eps),
+                          psi = max(psi, eps))         # eq. (104)
+    
+    # then sample beta_j | beta0, theta_j  ~ N(mean, var) per eq. (105)
+    A <- max(lambda.beta.g[g]^2 * eta[j]^2, eps)
+    B <- theta * max(D0[j], eps)
+    mean_beta <- beta_center[1] * A / (A + B)
+    var_beta  <- (A * B) / (A + B)
+    beta[j]   <- rnorm(1, mean_beta, sqrt(var_beta))   # eq. (105)
+    
+    # (3-3) keep the original sign for sqrt(theta) and map back to non-centered
+    theta.sqrt[j]  <- sgn * sqrt(theta)
+    beta.tilde[,j] <- (beta_center - beta[j]) / theta.sqrt[j]
+  }
+  
+  list(beta = beta, theta.sqrt = theta.sqrt, beta.tilde = beta.tilde)
+}
+
+sign_switch <- function(beta.tilde, theta.sqrt) {
+  d <- length(theta.sqrt)
+  for (j in 1:d) {
+    if (runif(1) < 0.5) {               
+      theta.sqrt[j]  <- -theta.sqrt[j]
+      beta.tilde[,j] <- -beta.tilde[,j]
+    }
+  }
+  list(beta.tilde = beta.tilde, theta.sqrt = theta.sqrt)
+}
+
+# H-GHS locals and groups in one place
+local_group_updates_hghs <- function(beta, theta.sqrt, 
+                                     lambda.theta.g, lambda.beta.g,  
+                                     xi.theta.g, xi.beta.g,          
+                                     kappa, zeta,   
+                                     grp) {
+  d <- length(beta); G <- max(grp)
+  s_g <- tabulate(grp, nbins = G)
+  
+  # squares we need
+  theta <- theta.sqrt^2
+  
+  # --- within-group locals: delta^2, eta^2 via GIG(0, psi, chi)
+  delta2 <- numeric(d); eta2 <- numeric(d)
+  for (i in seq_len(d)) {
+    g <- grp[i]
+    chi_delta <- .clamp(theta[i] / .clamp(lambda.theta.g[g]^2))
+    psi_delta <- .clamp(2 * kappa[i])
+    delta2[i] <- GIGrvg::rgig(1, lambda = 0, chi = chi_delta, psi = psi_delta)
+    
+    chi_eta <- .clamp(beta[i]^2 / .clamp(lambda.beta.g[g]^2))
+    psi_eta <- .clamp(2 * zeta[i])
+    eta2[i] <- GIGrvg::rgig(1, lambda = 0, chi = chi_eta, psi = psi_eta)
+  }
+  delta <- sqrt(delta2)
+  eta   <- sqrt(eta2)
+  
+  # --- group locals: lambda^2_g via GIG((1 - s_g)/2, 2*xi_g, SUM per group ...)
+  lambda.theta.g2 <- numeric(G)
+  lambda.beta.g2  <- numeric(G)
+  for (g in seq_len(G)) {
+    idx <- which(grp == g)
+    # sums weighted by within-group locals per §3.3.3
+    chi_theta_g <- .clamp(sum(theta[idx] / .clamp(delta2[idx])))
+    psi_theta_g <- .clamp(2 * xi.theta.g[g])
+    lambda.theta.g2[g] <- GIGrvg::rgig(1, lambda = (1 - s_g[g]) / 2,
+                                       chi = chi_theta_g, psi = psi_theta_g)
+    
+    chi_beta_g <- .clamp(sum(beta[idx]^2 / .clamp(eta2[idx])))
+    psi_beta_g <- .clamp(2 * xi.beta.g[g])
+    lambda.beta.g2[g] <- GIGrvg::rgig(1, lambda = (1 - s_g[g]) / 2,
+                                      chi = chi_beta_g, psi = psi_beta_g)
+  }
+  list(delta = delta, eta = eta,
+       lambda.theta.g = sqrt(lambda.theta.g2),
+       lambda.beta.g  = sqrt(lambda.beta.g2))
+}
+
+# group-level xi's and scalars nu; globals tau
+aux_and_globals_hghs <- function(lambda.theta.g, tau.theta,
+                                 lambda.beta.g,  tau.beta,
+                                 delta, eta,
+                                 kappa, zeta,
+                                 xi.theta.g, xi.beta.g,
+                                 nu.theta, nu.beta) {
+  G <- length(lambda.theta.g)
+  
+  # group xi updates
+  for (g in seq_len(G)) {
+    xi.theta.g[g] <- rgamma(1, shape = 1, rate = .clamp(lambda.theta.g[g]^2 + tau.theta^2))
+    xi.beta.g[g]  <- rgamma(1, shape = 1, rate = .clamp(lambda.beta.g[g]^2  + tau.beta^2))
+  }
+  
+  # globals tau
+  tau.theta2 <- rgamma(1, shape = (1 + G) / 2, rate = sum(xi.theta.g) + nu.theta)
+  tau.beta2  <- rgamma(1, shape = (1 + G) / 2, rate = sum(xi.beta.g)  + nu.beta)
+  tau.theta <- sqrt(tau.theta2); tau.beta <- sqrt(tau.beta2)
+  
+  # nu updates (half-Cauchy mixing)
+  nu.theta <- rgamma(1, shape = 1, rate = 1 + tau.theta^2)
+  nu.beta  <- rgamma(1, shape = 1, rate = 1 + tau.beta^2)
+  
+  # within-group kappa/zeta (half-Cauchy mixing for delta, eta)
+  #   κ | δ^2 ~ G(1, 1 + δ^2),    ζ | η^2 ~ G(1, 1 + η^2)
+  kappa <- rgamma(length(kappa), shape = 1, rate = 1 + delta^2)
+  zeta  <- rgamma(length(zeta),  shape = 1, rate = 1 + eta^2)
+  
+  list(xi.theta.g = xi.theta.g, xi.beta.g = xi.beta.g,
+       tau.theta = tau.theta, tau.beta = tau.beta,
+       nu.theta = nu.theta, nu.beta = nu.beta,
+       kappa = kappa, zeta = zeta)
+}
+
+# Sampling the noise variance
+variance.sampler = function(y,X,beta.tilde,beta,theta.sqrt,c0,C0){
+  Tn <- length(y)
+  d  <- ncol(X)
+  btild = beta.tilde[-1,]
+  W <- cbind(X, X*btild)
+  gam = c(beta,theta.sqrt)
+  var = C0 + 0.5*sum((y- W %*% gam)^2)
+  sigma2 = 1/rgamma(1,c0+Tn/2,var)
+  return(sigma2)
+}
+
+# Sampling C0 which is the auxiliary variable for the noise variance
+C0.sampler = function(sigma2,c0,g0,G0){
+  C0 = rgamma(1,g0+c0,G0 + 1/sigma2)
+  return(C0)
+}
+
+# Sampling the scale parameters of the initial distribution
+D0.sampler = function(X,beta.tilde,vd,cd){
+  d  <- ncol(X)
+  btild.zero = beta.tilde[1,]
+  D0 = rep(0,d)
+  for (j in 1:d){
+    D0[j] = 1/rgamma(1,vd+0.5,(vd-1)*cd+0.5*btild.zero[j]^2)
+  }
+  return(D0)
+}
+
+# Hierarchical Grouped Horseshoe TVP sampler (section 3.3.3)
+# y, X standardized; grp: integer vector (length d) with values 1..G
+shrinktvp_hgrouped <- function(y, X,
+                               beta, theta.sqrt, D0,
+                               # group locals (length G)
+                               lambda.theta.g, lambda.beta.g,
+                               # within-group locals (length d)
+                               delta, eta,
+                               # globals
+                               tau.theta, tau.beta,
+                               # auxiliaries
+                               xi.theta.g, xi.beta.g,  # length G
+                               kappa, zeta,            # length d
+                               nu.theta, nu.beta,
+                               # noise variance block
+                               sigma2, C0,
+                               cd, vd, c0, g0, G0,
+                               burnin, N,
+                               grp) {
+  Tn <- length(y); d <- ncol(X); G <- max(grp)
+  
+  # storage (same shapes as your original)
+  beta.sample         <- matrix(0, N, d)
+  theta.sqrt.sample   <- matrix(0, N, d)
+  lambda.theta.sample <- matrix(0, N, d)  
+  lambda.beta.sample  <- matrix(0, N, d)
+  tau.theta.sample    <- numeric(N)
+  tau.beta.sample     <- numeric(N)
+  
+  delta.sample <- matrix(0, N, d)
+  eta.sample <- matrix(0, N, d)
+  
+  for (i in 1:N) {
+    # 1) State draw
+    beta.tilde <- state.sampler(y, X, beta, theta.sqrt, D0, sigma2)
+    
+    # 2) Coefficients with effective per-coef lambdas
+    lambda.theta.eff <- lambda.theta.g[grp] * delta
+    lambda.beta.eff  <- lambda.beta.g[grp]  * eta
+    gam.sampler <- coeff.sampler(y, X, beta.tilde, lambda.theta.eff, lambda.beta.eff, sigma2)
+    beta       <- gam.sampler$beta
+    theta.sqrt <- gam.sampler$theta.sqrt
+    
+    # 3) Interweaving (unchanged) + sign switch
+    weaving.result <- interweave_hghs(
+      beta         = beta,
+      beta.tilde   = beta.tilde,
+      theta.sqrt   = theta.sqrt,
+      lambda.theta.g = lambda.theta.g,
+      delta        = delta,
+      lambda.beta.g  = lambda.beta.g,
+      eta          = eta,
+      D0           = D0,
+      grp          = grp
+    )
+    
+    theta.sqrt <- weaving.result$theta.sqrt
+    beta       <- weaving.result$beta
+    beta.tilde <- weaving.result$beta.tilde
+    
+    sw <- sign_switch(beta.tilde, theta.sqrt)
+    beta.tilde <- sw$beta.tilde
+    theta.sqrt <- sw$theta.sqrt
+    
+    beta.sample[i, ]       <- beta
+    theta.sqrt.sample[i, ] <- theta.sqrt
+    
+    # 4) H-GHS locals & group updates (GIG)
+    upd <- local_group_updates_hghs(beta, theta.sqrt,
+                                    lambda.theta.g, lambda.beta.g,
+                                    xi.theta.g, xi.beta.g,
+                                    kappa, zeta, grp)
+    delta          <- upd$delta
+    eta            <- upd$eta
+    lambda.theta.g <- upd$lambda.theta.g
+    lambda.beta.g  <- upd$lambda.beta.g
+    
+    # store effective per-coef lambdas (optional, useful for diagnostics)
+    lambda.theta.sample[i, ] <- lambda.theta.g[grp]
+    lambda.beta.sample[i, ]  <- lambda.beta.g[grp]
+    tau.theta.sample[i]      <- tau.theta
+    tau.beta.sample[i]       <- tau.beta
+    delta.sample[i, ] <- delta
+    eta.sample[i, ] <- eta
+    
+    # 5) Auxiliaries & globals (gamma)
+    ag <- aux_and_globals_hghs(lambda.theta.g, tau.theta,
+                               lambda.beta.g,  tau.beta,
+                               delta, eta,
+                               kappa, zeta,
+                               xi.theta.g, xi.beta.g,
+                               nu.theta, nu.beta)
+    xi.theta.g <- ag$xi.theta.g; xi.beta.g <- ag$xi.beta.g
+    tau.theta  <- ag$tau.theta;  tau.beta  <- ag$tau.beta
+    nu.theta   <- ag$nu.theta;   nu.beta   <- ag$nu.beta
+    kappa      <- ag$kappa;      zeta      <- ag$zeta
+    tau.theta.sample[i] <- tau.theta
+    tau.beta.sample[i]  <- tau.beta
+    
+    # 6) Noise variance & hyper
+    sigma2 <- variance.sampler(y, X, beta.tilde, beta, theta.sqrt, c0, C0)
+    C0     <- C0.sampler(sigma2, c0, g0, G0)
+    
+    # 7) Initial state scales
+    D0 <- D0.sampler(X, beta.tilde, vd, cd)
+  }
+  
+  keep <- seq.int(from = (burnin + 1L), to = N)
+  list(
+    beta         = beta.sample[keep, , drop = FALSE],
+    theta.sqrt   = theta.sqrt.sample[keep, , drop = FALSE],
+    lambda.theta = lambda.theta.sample[keep, , drop = FALSE], # effective per-coef
+    lambda.beta  = lambda.beta.sample[keep, , drop = FALSE],
+    tau.theta    = tau.theta.sample[keep],
+    tau.beta     = tau.beta.sample[keep],
+    delta = delta.sample[keep, , drop = FALSE],
+    eta   = eta.sample[keep, , drop = FALSE]
+  )
+}
