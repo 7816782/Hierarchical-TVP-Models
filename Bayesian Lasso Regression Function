@@ -1,0 +1,34 @@
+Blasso = function(X,y,tausq0,lamsq0,sigmasq0,burnin,N,r,delta){
+  y = y - mean(y)
+  p = ncol(X)
+  n = nrow(X)
+  X = scale(X)
+  beta.sample = matrix(NA,p,N)
+  tausq.sample = matrix(NA,p,N)
+  lamsq.sample = numeric(N)
+  sigmasq.sample = numeric(N)
+  for (i in 1:N) {
+    # sample beta
+    D.tau = diag(tausq0) 
+    A = t(X) %*% X + solve(D.tau)
+    Sigma = sigmasq0*solve(A) + 0.0001*diag(ncol(A))
+    R = chol(Sigma)
+    beta0 = solve(A) %*% t(X) %*% y + t(R) %*% rnorm(p)
+    beta.sample[,i] = beta0
+    # sample tau^2
+    for (j in 1:p){
+      tausq0[j] = 1/(statmod::rinvgauss(1,max(1e-7,sqrt(sigmasq0*lamsq0/beta0[j]^2)),max(1e-7,lamsq0)))
+    }
+    tausq.sample[,i] = tausq0
+    # sample lam^2
+    lamsq0 = rgamma(1,p+r,delta+1/2*sum(tausq0))
+    lamsq.sample[i] = lamsq0
+    # sample sigma^2
+    sigmasq0 = 1/rgamma(1,(n+p-1)/2,(sum((y - X %*% beta0)^2)+t(beta0) %*% 
+                          solve(D.tau) %*% beta0)/2)
+    sigmasq.sample[i] = sigmasq0
+  }
+  MCMCsampler = list(beta = beta.sample[,(burnin+1):N],tausq = tausq.sample[,(burnin+1):N],
+                     lamsq = lamsq.sample[burnin+1:N],sigmasq = sigmasq.sample[burnin+1:N])
+  return(MCMCsampler)
+}
